@@ -46,6 +46,8 @@ using MaxReduceOp = cub::Max;
 using MinReduceOp = cub::Min;
 #endif
 
+#define TOPK_MAX 8
+
 /// Aligned array type
 template <
     typename T,
@@ -226,13 +228,30 @@ __launch_bounds__(TPB) __global__ void moeOnlineSoftmax(
 }
 
 
-__device__ void insert(float* arr, int idx, float val) {
-    if (val<= arr[idx-1]) return;
+// 定义存储Top-K元素及其索引的结构
+struct TopKPair {
+    float value;
+    int index;
+    __device__ TopKPair() {}
+    __device__ TopKPair(float v, int i) : value(v), index(i) {}
+};
+
+
+struct TopKPairDecomposer {
+    __device__ auto operator()(TopKPair& pair) const {
+        // 先按value(float)排序，再按index(int)排序
+        return cuda::std::tie(pair.value);
+    }
+};
+
+
+__device__ void insert(TopKPair* arr, int idx, float val, int index) {
+    if (val<= arr[idx-1].value) return;
 
     int l=0, r=idx-1;
     while (l<r) {
         int mid = l + (r-l)/2;
-        if (arr[mid] > val) {
+        if (arr[mid].value > val) {
             l = mid+1;
         } else {
             r = mid;
@@ -240,77 +259,54 @@ __device__ void insert(float* arr, int idx, float val) {
     }
 
     for (int i=idx-1; i>l; --i) {
-        arr[i] = arr[i-1];
+        arr[i].value = arr[i-1].value;
+        arr[i].index = arr[i-1].index;
     }
-    arr[l] = val;
+    arr[l].value = val;
+    arr[l].index = index;
 }
-
-__device__ __forceinline__
-void mergeTopK(const float* A, const float* B, int k, float* C) {
-    int i=0, j=0;
-    for (int c=0; c<k; ++c) {
-        if (i<k and (j>=k or A[i]>=B[j])) {
-            C[c] = A[i++];
-        } else {
-            C[c] = B[j++];
-        }
-    }
-}
-
 
 template<int TPB>
 __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, int* indices, int N, int k) {
-    extern __shared__ float shared_mem[];
-    int tx = threadIdx.x;
-    float* buf_a = shared_mem;
-    float* my_a = buf_a + tx * k;
-    const int thread_read_offset = blockIdx.x * N;
+    
 
-    for (int idx = 0; idx < k; ++idx) {
-        my_a[idx] = -INFINITY;
+    // Allocate shared memory for `cub::BlockRadixSort`
+    const int K  = 4;
+    using block_radix_sort_t = cub::BlockRadixSort<TopKPair, TPB, K>;
+    __shared__ typename block_radix_sort_t::TempStorage temp_storage;
+
+    
+    int tid = threadIdx.x;
+    // int block_start = blockIdx.x * N;   
+    
+    TopKPair thread_topk[K];
+    // construct our own data
+    for (int i = 0; i < K; i++) {
+        thread_topk[i] = {-INFINITY, -1};
     }
-    // __syncthreads();
-
-    #pragma unroll
-    for(int idx = tx; idx < N; idx += TPB) {
-        insert(my_a, k, input[idx + thread_read_offset]);
+    
+    // handle it
+    for (int i = tid; i < N; i += TPB) {
+        float val = input[blockIdx.x * N + i];
+        int index = i;
+        // if (val > thread_topk.value) {
+        //   thread_topk.value = val;
+        //   thread_topk.index = index;
+        // }
+        insert(thread_topk, K, val, index);
     }
-    __syncthreads();
-
-    #pragma unroll
-    for (int stride=TPB/2; stride>=1; stride/=2) {
-        if (tx<stride) {
-            // 复制当前线程的数据到临时位置
-        // float temp_a[k];
-        float* temp_a = (float*)alloca(k * sizeof(float));  
-        for (int i = 0; i < k; i++) {
-            temp_a[i] = my_a[i];
-        }
-        
-        // 获取目标线程的数据
-        float* src_b = buf_a + (tx + stride) * k;
-        
-        // 合并到当前线程的位置
-        mergeTopK(temp_a, src_b, k, my_a);
-        }
-        __syncthreads();
-    }
-
-    if (tx==0) {
-        for (int idx=0; idx<k; ++idx) {
-            output[blockIdx.x * k + idx] = buf_a[idx];
-        }
-    }
-
-    #pragma unroll
-    for(int idx = tx; idx < N; idx += TPB) {
-        for (int i = 0; i < k; i++) {
-          // 直接比较粒度太粗
-          if (__float_as_int(input[idx + thread_read_offset]) == __float_as_int(buf_a[i])) {
-              atomicExch(&indices[blockIdx.x * k + i], idx);
-              break;
-          }
-        }
+    
+    TopKPairDecomposer decomposer;
+    block_radix_sort_t(temp_storage).SortDescending(thread_topk, decomposer);
+    
+    // write it back
+    if (K * tid < k) {
+      for (int i = tid * K; i < k; i++) 
+      {
+         output[blockIdx.x * k + i] = thread_topk[i].value;
+        indices[blockIdx.x * k + i] = thread_topk[i].index;
+      }
+     
     }
 }
 
@@ -771,8 +767,7 @@ void topkGatingSoftmaxKernelLauncher(
         softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
       }
       else {
-        static constexpr int TPB2 = 64;
-        topK<TPB2><<<num_tokens, TPB2, TPB2 * topk * sizeof(float), stream>>>(
+        topK<TPB / 4><<<num_tokens, TPB / 4, 0, stream>>>(
             softmax_workspace, topk_weights, topk_indices, num_experts, topk
           );
       }
