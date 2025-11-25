@@ -269,7 +269,7 @@ __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, i
     for (int idx = 0; idx < k; ++idx) {
         my_a[idx] = -INFINITY;
     }
-    __syncthreads();
+    // __syncthreads();
 
     #pragma unroll
     for(int idx = tx; idx < N; idx += TPB) {
@@ -303,11 +303,12 @@ __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, i
     }
 
     #pragma unroll
-    for(int idx = tx; idx<N; idx += TPB) {
+    for(int idx = tx; idx < N; idx += TPB) {
         for (int i = 0; i < k; i++) {
-          if (input[idx + thread_read_offset] == buf_a[i]) {
-            // indices[blockIdx.x * k + i] = idx + thread_read_offset;
-             atomicExch(&indices[blockIdx.x * k + i], idx + thread_read_offset);
+          // 直接比较粒度太粗
+          if (__float_as_int(input[idx + thread_read_offset]) == __float_as_int(buf_a[i])) {
+              atomicExch(&indices[blockIdx.x * k + i], idx);
+              break;
           }
         }
     }
