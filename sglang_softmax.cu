@@ -266,12 +266,12 @@ __device__ void insert(TopKPair* arr, int idx, float val, int index) {
     arr[l].index = index;
 }
 
-template<int TPB>
+template<int TPB, int K>
 __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, int* indices, int N, int k) {
     
 
     // Allocate shared memory for `cub::BlockRadixSort`
-    const int K  = 4;
+    // const int K  = 4;
     using block_radix_sort_t = cub::BlockRadixSort<TopKPair, TPB, K>;
     __shared__ typename block_radix_sort_t::TempStorage temp_storage;
 
@@ -289,25 +289,32 @@ __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, i
     for (int i = tid; i < N; i += TPB) {
         float val = input[blockIdx.x * N + i];
         int index = i;
-        // if (val > thread_topk.value) {
-        //   thread_topk.value = val;
-        //   thread_topk.index = index;
-        // }
         insert(thread_topk, K, val, index);
+        // if (thread_topk[0].value < val) {
+        //   thread_topk[0].value = val;
+        //   thread_topk[0].index = index;
+        // }
     }
     
     TopKPairDecomposer decomposer;
     block_radix_sort_t(temp_storage).SortDescending(thread_topk, decomposer);
+    // if (tid < k) {
+    //    output[blockIdx.x * k + tid] = thread_topk[0].value;
+    //    indices[blockIdx.x * k + tid] = thread_topk[0].index;
+    // }
     
     // write it back
-    if (K * tid < k) {
-      for (int i = tid * K; i < k; i++) 
-      {
-         output[blockIdx.x * k + i] = thread_topk[i].value;
-        indices[blockIdx.x * k + i] = thread_topk[i].index;
-      }
+    #pragma unroll
+    for (int i = 0; i < K; i++) 
+    {
+        int j = K * tid + i;
+        if (j < k) {
+          output[blockIdx.x * k + j] = thread_topk[i].value;
+          indices[blockIdx.x * k + j] = thread_topk[i].index;
+        }
+        
+   }
      
-    }
 }
 
 
@@ -767,9 +774,23 @@ void topkGatingSoftmaxKernelLauncher(
         softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
       }
       else {
-        topK<TPB / 4><<<num_tokens, TPB / 4, 0, stream>>>(
-            softmax_workspace, topk_weights, topk_indices, num_experts, topk
-          );
+        switch (topk) {
+          case 1: topK<TPB / 8, 1><<<num_tokens, TPB / 8, 0, stream>>>(
+            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
+            break;
+          case 2: topK<TPB / 8, 2><<<num_tokens, TPB / 8, 0, stream>>>(
+            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
+            break;
+          case 4:
+            topK<TPB / 8, 4><<<num_tokens, TPB / 8, 0, stream>>>(
+            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
+            break;
+          default:
+            topK<TPB / 8, 8><<<num_tokens, TPB / 8, 0, stream>>>(
+            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
+        }
+            
+
       }
       
       }
