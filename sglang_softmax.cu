@@ -320,7 +320,7 @@ __launch_bounds__(TPB) __global__ void topK(const float* input, float* output, i
 
 template <int TPB>
 __launch_bounds__(TPB) __global__ void moeTopK(
-    const float* inputs_after_softmax,
+    float* inputs_after_softmax,
     const bool* finished,
     float* output,
     int* indices,
@@ -351,13 +351,13 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
 
-      for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
+      // for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
+      //   const int prior_winning_expert = indices[k * block_row + prior_k];
 
-        if (prior_winning_expert == expert) {
-          inp_kvp = thread_kvp;
-        }
-      }
+      //   if (prior_winning_expert == expert) {
+      //     inp_kvp = thread_kvp;
+      //   }
+      // }
 
       thread_kvp = arg_max(inp_kvp, thread_kvp);
     }
@@ -368,6 +368,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const int expert = result_kvp.key;
       const bool node_uses_expert = expert >= start_expert && expert < end_expert;
       const bool should_process_row = row_is_active && node_uses_expert;
+      inputs_after_softmax[thread_read_offset + expert] = -1.f;
 
       const int idx = k * block_row + k_idx;
       output[idx] = result_kvp.value;
