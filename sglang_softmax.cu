@@ -228,94 +228,45 @@ __launch_bounds__(TPB) __global__ void moeOnlineSoftmax(
 }
 
 
-// 定义存储Top-K元素及其索引的结构
 struct TopKPair {
-    float value;
-    int index;
-    __device__ TopKPair() {}
-    __device__ TopKPair(float v, int i) : value(v), index(i) {}
+    using cub_kvp = cub::KeyValuePair<int, float>;
+    cub_kvp kvp1;
+    cub_kvp kvp2;
+    
+    // 构造函数
+    __device__  TopKPair() : kvp1{0, -1.0f}, kvp2{0, -1.0f} {}
+    __device__  TopKPair(cub_kvp k1, cub_kvp k2) : kvp1(k1), kvp2(k2) {}
 };
 
 
-struct TopKPairDecomposer {
-    __device__ auto operator()(TopKPair& pair) const {
-        // 先按value(float)排序，再按index(int)排序
-        return cuda::std::tie(pair.value);
-    }
-};
-
-
-__device__ void insert(TopKPair* arr, int idx, float val, int index) {
-    if (val<= arr[idx-1].value) return;
-
-    int l=0, r=idx-1;
-    while (l<r) {
-        int mid = l + (r-l)/2;
-        if (arr[mid].value > val) {
-            l = mid+1;
+struct TopKPairArgMax {
+    using cub_kvp = cub::KeyValuePair<int, float>;
+    __device__ TopKPairArgMax() {}
+    __device__ __forceinline__
+    TopKPair operator()(const TopKPair &a, const TopKPair &b) const {
+        // 已知: a.kvp1 >= a.kvp2, b.kvp1 >= b.kvp2
+        
+        cub_kvp top1, top2;
+        
+        // 步骤1: 确定第一名
+        if (a.kvp1.value > b.kvp1.value) {
+            top1 = a.kvp1;
         } else {
-            r = mid;
-        }
-    }
-
-    for (int i=idx-1; i>l; --i) {
-        arr[i].value = arr[i-1].value;
-        arr[i].index = arr[i-1].index;
-    }
-    arr[l].value = val;
-    arr[l].index = index;
-}
-
-template<int TPB, int K>
-__launch_bounds__(TPB) __global__ void topK(const float* input, float* output, int* indices, int N, int k) {
-    
-
-    // Allocate shared memory for `cub::BlockRadixSort`
-    // const int K  = 4;
-    using block_radix_sort_t = cub::BlockRadixSort<TopKPair, TPB, K>;
-    __shared__ typename block_radix_sort_t::TempStorage temp_storage;
-
-    
-    int tid = threadIdx.x;
-    // int block_start = blockIdx.x * N;   
-    
-    TopKPair thread_topk[K];
-    // construct our own data
-    for (int i = 0; i < K; i++) {
-        thread_topk[i] = {-INFINITY, -1};
-    }
-    
-    // handle it
-    for (int i = tid; i < N; i += TPB) {
-        float val = input[blockIdx.x * N + i];
-        int index = i;
-        insert(thread_topk, K, val, index);
-        // if (thread_topk[0].value < val) {
-        //   thread_topk[0].value = val;
-        //   thread_topk[0].index = index;
-        // }
-    }
-    
-    TopKPairDecomposer decomposer;
-    block_radix_sort_t(temp_storage).SortDescending(thread_topk, decomposer);
-    // if (tid < k) {
-    //    output[blockIdx.x * k + tid] = thread_topk[0].value;
-    //    indices[blockIdx.x * k + tid] = thread_topk[0].index;
-    // }
-    
-    // write it back
-    #pragma unroll
-    for (int i = 0; i < K; i++) 
-    {
-        int j = K * tid + i;
-        if (j < k) {
-          output[blockIdx.x * k + j] = thread_topk[i].value;
-          indices[blockIdx.x * k + j] = thread_topk[i].index;
+            top1 = b.kvp1;
         }
         
-   }
-     
-}
+        // 步骤2: 确定第二名
+        if (top1.key == a.kvp1.key) {
+            // 如果第一名来自a.kvp1，那么第二名在 a.kvp2 和 b.kvp1 之间
+            top2 = (a.kvp2.value > b.kvp1.value) ? a.kvp2 : b.kvp1;
+        } else {
+            // 如果第一名来自b.kvp1，那么第二名在 b.kvp2 和 a.kvp1 之间
+            top2 = (b.kvp2.value > a.kvp1.value) ? b.kvp2 : a.kvp1;
+        }
+        
+        return TopKPair(top1, top2);
+    }
+};
 
 
 template <int TPB>
@@ -330,51 +281,63 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     const int end_expert,
     const bool renormalize) {
   using cub_kvp = cub::KeyValuePair<int, float>;
-  using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+  using BlockReduce = cub::BlockReduce<TopKPair, TPB>;
   __shared__ typename BlockReduce::TempStorage tmpStorage;
 
-  cub_kvp thread_kvp;
-  cub::ArgMax arg_max;
+  TopKPair thread_kvp;
 
   const int block_row = blockIdx.x;
 
   const bool row_is_active = finished ? !finished[block_row] : true;
   const int thread_read_offset = blockIdx.x * num_experts;
   float row_sum_for_renormalize = 0;
-  for (int k_idx = 0; k_idx < k; ++k_idx) {
-    thread_kvp.key = 0;
-    thread_kvp.value = -1.f;  // This is OK because inputs are probabilities
+  for (int k_idx = 0; k_idx < (k + 2 - 1) / 2; ++k_idx) {
+    thread_kvp.kvp1.key = 0;
+    thread_kvp.kvp1.value = -1.f;  // This is OK because inputs are probabilities
+    thread_kvp.kvp2.key = 0;
+    thread_kvp.kvp2.value = -1.f;  // This is OK because inputs are probabilities
 
     cub_kvp inp_kvp;
     for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
       const int idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
-
-      // for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-      //   const int prior_winning_expert = indices[k * block_row + prior_k];
-
-      //   if (prior_winning_expert == expert) {
-      //     inp_kvp = thread_kvp;
-      //   }
-      // }
-
-      thread_kvp = arg_max(inp_kvp, thread_kvp);
+      if (inp_kvp.value > thread_kvp.kvp1.value) {
+          thread_kvp.kvp2 = thread_kvp.kvp1;
+          thread_kvp.kvp1 = inp_kvp;
+      }
+      else if (inp_kvp.value > thread_kvp.kvp2.value) {
+        thread_kvp.kvp2 = inp_kvp;
+      }
     }
 
-    const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+    // const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+    TopKPairArgMax reducer;
+    const TopKPair result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, reducer);
     if (threadIdx.x == 0) {
       // Ignore experts the node isn't responsible for with expert parallelism
-      const int expert = result_kvp.key;
-      const bool node_uses_expert = expert >= start_expert && expert < end_expert;
-      const bool should_process_row = row_is_active && node_uses_expert;
+      int expert = result_kvp.kvp1.key;
+      bool node_uses_expert = expert >= start_expert && expert < end_expert;
+      bool should_process_row = row_is_active && node_uses_expert;
       inputs_after_softmax[thread_read_offset + expert] = -1.f;
 
-      const int idx = k * block_row + k_idx;
-      output[idx] = result_kvp.value;
+      int idx = k * block_row + k_idx * 2;
+      output[idx] = result_kvp.kvp1.value;
       indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
       assert(indices[idx] >= 0);
-      row_sum_for_renormalize += result_kvp.value;
+      row_sum_for_renormalize += result_kvp.kvp1.value;
+      if (k != 1) {
+        expert = result_kvp.kvp2.key;
+        node_uses_expert = expert >= start_expert && expert < end_expert;
+        should_process_row = row_is_active && node_uses_expert;
+        inputs_after_softmax[thread_read_offset + expert] = -1.f;
+
+        idx = k * block_row + k_idx * 2 + 1;
+        output[idx] = result_kvp.kvp2.value;
+        indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+        assert(indices[idx] >= 0);
+        row_sum_for_renormalize += result_kvp.kvp2.value;
+      }
     }
     __syncthreads();
   }
@@ -770,30 +733,8 @@ void topkGatingSoftmaxKernelLauncher(
       static constexpr int TPB = 256;
       moeSoftmax<T, TPB><<<num_tokens, TPB, 0, stream>>>(
           gating_output, nullptr, softmax_workspace, num_experts, moe_softcapping, correction_bias);
-      if (!optimize) {
         moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
         softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
-      }
-      else {
-        switch (topk) {
-          case 1: topK<TPB / 8, 1><<<num_tokens, TPB / 8, 0, stream>>>(
-            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
-            break;
-          case 2: topK<TPB / 8, 2><<<num_tokens, TPB / 8, 0, stream>>>(
-            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
-            break;
-          case 4:
-            topK<TPB / 8, 4><<<num_tokens, TPB / 8, 0, stream>>>(
-            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
-            break;
-          default:
-            topK<TPB / 8, 8><<<num_tokens, TPB / 8, 0, stream>>>(
-            softmax_workspace, topk_weights, topk_indices, num_experts, topk);
-        }
-            
-
-      }
-      
       }
   } 
 }
